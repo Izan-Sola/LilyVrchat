@@ -1,13 +1,13 @@
 import { exec } from "child_process";
 import { promisify } from "util";
 import fs from "fs";
-
+import { fixEscapedApostrophes } from "./brain.js"
 const execAsync = promisify(exec);
 const EDGE_TTS_BIN = "/home/izansolaserver/.local/bin/edge-tts"; // adjust if it's not on PATH, e.g. full path from `which edge-tts`
 const SINK_NAME = "lily_voice";
 
 function sanitizeInput(text) {
-  return text.replace(/[\r\n]+/g, " ").trim();
+  return fixEscapedApostrophes(text.replace(/[\r\n]+/g, " ").trim());
 }
 
 export async function speak(text) {

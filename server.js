@@ -3,19 +3,57 @@ import { say } from "./chatbox.js";
 import { queryBrainText, queryBrainVision } from "./brain.js";
 import { captureBase64 } from "./perception.js";
 import { speak } from "./voice.js";
-const IDLE_MESSAGE = "[ShinyShadow_'s AI Daughter] To talk to me, click the link in my profile and input your prompt through the web interface.";
-const IDLE_DELAY_MS = 5000; // how long her real reply stays up before reverting to idle text
 
-let idleTimer = null;
+
+//const IDLE_MESSAGE = "[ShinyShadow_'s AI Daughter] Talk to me via the web interface linked in my profile. (WIP: prompt her via voice)";
+const IDLE_MESSAGE = "[ShinyShadow_'s AI Daughter] How to talk to me: Either start your sentence with 'Lily' or via the web linked in my profile and I reply in game."
+
+const IDLE_RESEND_INTERVAL_MS = 15000;
+const REPLY_HOLD_MS = 8500;
+const COOLDOWN_MS = 10000;
+export function handleReply(reply) {
+  stopIdleLoop();
+  if (replyTimer) clearTimeout(replyTimer);
+  say(reply);
+  const speakPromise = speak(reply); // capture the promise instead of firing-and-forgetting
+  replyTimer = setTimeout(startIdleLoop, REPLY_HOLD_MS);
+  return speakPromise;
+}
+export { checkCooldown };
+let idleInterval = null;
+let replyTimer = null;
+let lastSentAt = 0;
 
 export function showIdleMessage() {
   say(IDLE_MESSAGE);
 }
 
+function startIdleLoop() {
+  stopIdleLoop();
+  showIdleMessage();
+  idleInterval = setInterval(showIdleMessage, IDLE_RESEND_INTERVAL_MS);
+}
+
+function stopIdleLoop() {
+  if (idleInterval) clearInterval(idleInterval);
+  idleInterval = null;
+}
+
 function showReplyThenRevert(reply) {
-  if (idleTimer) clearTimeout(idleTimer);
+  stopIdleLoop();
+  if (replyTimer) clearTimeout(replyTimer);
   say(reply);
-  idleTimer = setTimeout(showIdleMessage, IDLE_DELAY_MS);
+  replyTimer = setTimeout(startIdleLoop, REPLY_HOLD_MS);
+}
+
+function checkCooldown() {
+  const now = Date.now();
+  const elapsed = now - lastSentAt;
+  if (elapsed < COOLDOWN_MS) {
+    return Math.ceil((COOLDOWN_MS - elapsed) / 1000);
+  }
+  lastSentAt = now;
+  return 0;
 }
 
 const PAGE = `
@@ -39,8 +77,10 @@ const PAGE = `
   <button id="sendText">Send</button>
   <button id="sendVision">Send + Screenshot of what SHE sees. </button>
   <div id="log"></div>
-
-  <script>
+ <h1>READ THIS: <br> <br> </h1>
+  <p> Via this web interface you can input prompts to her and she will reply in game. There is a 10 second global cooldown <br> <br>
+  You can also speak to her in game by saying her name (Lily) in your sentence, but it can be inconsistent (not the best hardware on my side plus <br><br>
+  the noise/voices around can mess with the audio capture) </p> <script>
     const msgEl = document.getElementById("msg");
     const logEl = document.getElementById("log");
 
@@ -64,6 +104,10 @@ const PAGE = `
           body: JSON.stringify({ text }),
         });
         const data = await res.json();
+        if (res.status === 429) {
+          logLine("reply", "(" + data.error + ")");
+          return;
+        }
         logLine("reply", "Lily: " + (data.reply ?? "(error)"));
       } catch (err) {
         logLine("reply", "Lily: (request failed)");
@@ -83,31 +127,46 @@ const PAGE = `
 export function startWebServer(port = 3000) {
   const app = express();
   app.use(express.json());
+  startIdleLoop();
 
   app.get("/", (req, res) => res.send(PAGE));
 
-app.post("/api/text", async (req, res) => {
-  const text = (req.body?.text ?? "").trim();
-  if (!text) return res.status(400).json({ error: "empty message" });
-  const reply = await queryBrainText(text);
-  showReplyThenRevert(reply);
-  speak(reply);
-  res.json({ reply });
-});
-
-app.post("/api/vision", async (req, res) => {
-  const text = (req.body?.text ?? "").trim();
-  if (!text) return res.status(400).json({ error: "empty message" });
-  try {
-    const imageBase64 = await captureBase64();
-    const reply = await queryBrainVision(text, imageBase64);
+  app.post("/api/text", async (req, res) => {
+    const remaining = checkCooldown();
+    if (remaining > 0) {
+      return res.status(429).json({ error: `Cooldown active, wait ${remaining}s` });
+    }
+    const text = (req.body?.text ?? "").trim();
+    if (!text) return res.status(400).json({ error: "empty message" });
+    console.log(`[chat] IN  (text): ${text}`);
+    const reply = await queryBrainText(text);
+    console.log(`[chat] OUT (text): ${reply}`);
     showReplyThenRevert(reply);
     speak(reply);
     res.json({ reply });
-  } catch (err) {
-    res.status(500).json({ error: "screenshot capture failed" });
-  }
-});
+  });
+
+  app.post("/api/vision", async (req, res) => {
+    const remaining = checkCooldown();
+    if (remaining > 0) {
+      return res.status(429).json({ error: `Cooldown active, wait ${remaining}s` });
+    }
+    const text = (req.body?.text ?? "").trim();
+    if (!text) return res.status(400).json({ error: "empty message" });
+    console.log(`[chat] IN  (vision): ${text}`);
+    try {
+      const imageBase64 = await captureBase64();
+      const reply = await queryBrainVision(text, imageBase64);
+      console.log(`[chat] OUT (vision): ${reply}`);
+      showReplyThenRevert(reply);
+      speak(reply);
+      res.json({ reply });
+    } catch (err) {
+      console.error(`[chat] vision failed: ${err.message}`);
+      res.status(500).json({ error: "screenshot capture failed" });
+    }
+  });
+
   app.listen(port, "0.0.0.0", () => {
     console.log(`[web] Lily console at http://<laptop-ip>:${port}`);
   });

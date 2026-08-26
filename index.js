@@ -3,11 +3,11 @@ import { initOsc } from "./osc.js";
 import { say } from "./chatbox.js";
 import { queryBrainText, queryBrainVision } from "./brain.js";
 import { startWebServer, showIdleMessage } from "./server.js";
+import { startVoiceListener } from "./audioLoop.js";
 
 initOsc();
-showIdleMessage();
 startWebServer(3030);
-
+startVoiceListener();
 console.log(`
 Commands:
   !<text>    - send text-only message to Lily     (e.g. !hi)
