@@ -4,6 +4,7 @@ import { nodewhisper } from "nodejs-whisper";
 import cfg from "./config.js";
 import { queryBrainText, queryBrainButtIn } from "./brain.js";
 import { handleReply, checkCooldown } from "./server.js";
+import { setStatus } from "./status.js";
 
 const realLog = (msg) => process.stdout.write(msg + "\n");
 
@@ -16,10 +17,14 @@ function captureChunk(outPath, seconds, id) {
   return new Promise((resolve, reject) => {
     let remaining = seconds;
     realLog(`[voice] #${id} recording... ${remaining}`);
+    setStatus(`Listening: ${remaining}s...`);
 
     const countdown = setInterval(() => {
       remaining--;
-      if (remaining > 0) realLog(`[voice] #${id} recording... ${remaining}`);
+      if (remaining > 0) {
+        realLog(`[voice] #${id} recording... ${remaining}`);
+        setStatus(`Listening: ${remaining}s...`);
+      }
     }, 1000);
 
     const proc = spawn("timeout", [
@@ -80,6 +85,7 @@ async function loop() {
     await captureChunk(path, cfg.AUDIO_CHUNK_SECONDS, id);
 
     realLog(`[voice] #${id} processing audio...`);
+    setStatus("Processing audio...");
     const rawText = await transcribe(path);
     realLog(`[voice] #${id} processed audio.`);
     await unlink(path).catch(() => {});
@@ -95,6 +101,7 @@ async function loop() {
         const remaining = checkCooldown();
         if (remaining <= 0) {
           realLog(`[voice] input: ${trigger}`);
+          setStatus("Thinking...");
           const reply = await queryBrainText(trigger);
           realLog(`[voice] lily response: ${reply}`);
           await handleReply(reply); // wait for her to actually finish speaking before looping
@@ -114,6 +121,7 @@ async function runButtInCheck() {
   ambientBuffer = [];
 
   if (transcript && checkCooldown() <= 0) {
+    setStatus("Thinking...");
     const reply = await queryBrainButtIn(transcript);
     if (reply !== "NONE") {
       realLog(`[voice] butt-in: ${reply}`);

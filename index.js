@@ -1,9 +1,9 @@
 import readline from "readline";
 import { initOsc } from "./osc.js";
-import { say } from "./chatbox.js";
 import { queryBrainText, queryBrainVision } from "./brain.js";
-import { startWebServer, showIdleMessage } from "./server.js";
+import { startWebServer, handleReply } from "./server.js";
 import { startVoiceListener } from "./audioLoop.js";
+import { captureBase64 } from "./perception.js";
 
 initOsc();
 startWebServer(3030);
@@ -35,7 +35,7 @@ rl.on("line", async (line) => {
     reply = await queryBrainText(text);
   }
 
-  say(reply);
+  handleReply(reply);
   console.log(`Lily: ${reply}`);
 });
 
