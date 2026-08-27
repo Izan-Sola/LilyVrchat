@@ -1,7 +1,7 @@
 import { spawn } from "child_process";
 import { unlink, readFile } from "fs/promises";
 import cfg from "./config.js";
-import { queryBrainText, queryBrainButtIn } from "./brain.js";
+import { queryBrainMessage } from "./brain.js";
 import { handleReply, checkCooldown } from "./server.js";
 import { setStatus } from "./status.js";
 
@@ -11,7 +11,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let running = false;
 let chunkCounter = 0;
 let ambientBuffer = [];
-let lastTranscript = ""; // most recent non-empty ambient transcription -- backspace force-sends this
+let lastTranscript = ""; // most recent non-empty ambient transcription -- backspace/tab force-send this
 let buttInTimer = null;
 let buttInEnabled = true;
 
@@ -78,20 +78,23 @@ export function skipCurrentRecording() {
   }
 }
 
-// Triggered by pressing Backspace in the terminal. Force-sends whatever
-// the last ambient chunk transcribed, no wake word or cooldown required --
-// sends unconditionally, same as the manual (Enter) path does.
-export async function forceSendLastTranscript() {
+// Triggered by pressing Backspace (no image) or Tab (with image) in the
+// terminal. Force-sends whatever the last ambient chunk transcribed, no
+// wake word or cooldown required -- sends unconditionally, same as the
+// manual (Enter) path does. `withImage` opts into a screenshot for this
+// one forced send only; the regular voice paths stay text-only since
+// attaching a screenshot every turn was too slow for live back-and-forth.
+export async function forceSendLastTranscript(withImage = false) {
   const text = lastTranscript;
   if (!text) {
-    realLog("[voice] backspace pressed but nothing transcribed yet");
+    realLog(`[voice] force-send pressed but nothing transcribed yet`);
     return;
   }
   lastTranscript = "";
 
-  realLog(`[voice] input (forced): ${text}`);
-  setStatus("Thinking...");
-  const reply = await queryBrainText(text);
+  realLog(`[voice] input (forced${withImage ? " +image" : ""}): ${text}`);
+  setStatus(withImage ? "Thinking (with image)..." : "Thinking...");
+  const reply = await queryBrainMessage("user", text, { withImage });
   realLog(`[voice] lily response (forced): ${reply}`);
   await handleReply(reply);
 }
@@ -170,11 +173,11 @@ async function loop() {
     realLog(`[voice] > Processing audio...`);
     setStatus("Processing audio...");
     const rawText = await transcribe(path);
-    realLog(`[voice] > Rrocessed audio.`);
+    realLog(`[voice] > Processed audio.`);
     await unlink(path).catch(() => {});
 
     const text = cleanTranscript(rawText);
-    realLog(`[voice] > Reard: "${text}"`);
+    realLog(`[voice] > Heard: "${text}"`);
 
     if (text) {
       ambientBuffer.push(text);
@@ -186,7 +189,7 @@ async function loop() {
         if (remaining <= 0) {
           realLog(`[voice] input: ${trigger}`);
           setStatus("Thinking...");
-          const reply = await queryBrainText(trigger);
+          const reply = await queryBrainMessage("user", trigger);
           realLog(`[voice] lily response: ${reply}`);
           await handleReply(reply); // wait for her to actually finish speaking before looping
         }
@@ -211,7 +214,7 @@ async function runButtInCheck() {
 
   if (buttInEnabled && transcript && checkCooldown() <= 0) {
     setStatus("Thinking...");
-    const reply = await queryBrainButtIn(transcript);
+    const reply = await queryBrainMessage("ambient", transcript);
     if (reply !== "NONE") {
       realLog(`[voice] butt-in: ${reply}`);
       await handleReply(reply);
@@ -300,7 +303,7 @@ async function stopManualRecording() {
 
   realLog(`[voice] input (manual): ${text}`);
   setStatus("Thinking...");
-  const reply = await queryBrainText(text);
+  const reply = await queryBrainMessage("user", text);
   realLog(`[voice] lily response (manual): ${reply}`);
   await handleReply(reply);
   manualActive = false;

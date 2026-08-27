@@ -1,9 +1,9 @@
 import readline from "readline";
 import { initOsc } from "./osc.js";
-import { queryBrainText, queryBrainVision } from "./brain.js";
+import { queryBrainMessage } from "./brain.js";
+import { triggerAvatarActionById } from "./avatarActions.js";
 import { startWebServer, handleReply } from "./server.js";
 import { startVoiceListener, skipCurrentRecording, toggleManualRecording, toggleButtIn, forceSendLastTranscript } from "./audioLoop.js";
-import { captureBase64 } from "./perception.js";
 
 initOsc();
 startWebServer(3030);
@@ -13,7 +13,9 @@ Commands:
   !<text>    - send text-only message to Lily     (e.g. !hi)
   !+<text>   - screenshot + message to Lily        (e.g. !+what do you see)
   <space>    - while Lily is listening, skip the countdown and process now
-  <backspace> - force-send whatever was last transcribed, no wake word or cooldown needed
+  <backspace> - force-send whatever was last transcribed, text-only, no wake word or cooldown needed
+  <tab>      - same as backspace, but attaches a screenshot to the forced send
+  1-8        - fire the matching avatar action directly over OSC (testing, bypasses the brain)
   <enter>    - press on an empty line to start an untimed recording; press
                again to stop, transcribe, and send it -- bypasses the wake word
   b          - toggle ambient butt-in commentary on/off
@@ -42,6 +44,13 @@ if (process.stdin.isTTY) {
     if (key?.name === "backspace") {
       forceSendLastTranscript();
     }
+    if (key?.name === "tab") {
+      forceSendLastTranscript(true);
+    }
+    if (key?.name && !key.ctrl && !key.meta && /^[1-8]$/.test(key.name)) {
+      const result = triggerAvatarActionById(Number(key.name));
+      console.log(`[test] ${result}`);
+    }
   });
 }
 
@@ -58,16 +67,11 @@ rl.on("line", async (line) => {
     return;
   }
 
-  let reply;
-  if (raw.startsWith("!+")) {
-    const text = raw.slice(2).trim();
-    console.log("(capturing screenshot...)");
-    const imageBase64 = await captureBase64();
-    reply = await queryBrainVision(text, imageBase64);
-  } else {
-    const text = raw.slice(1).trim();
-    reply = await queryBrainText(text);
-  }
+  // Every prompt now always carries a screenshot, so !text and !+text
+  // behave the same -- !+ is kept around as a familiar alias.
+  const text = raw.startsWith("!+") ? raw.slice(2).trim() : raw.slice(1).trim();
+  console.log("(capturing screenshot...)");
+  const reply = await queryBrainMessage("user", text, { withImage: true });
 
   handleReply(reply);
   console.log(`Lily: ${reply}`);

@@ -1,12 +1,11 @@
 import express from "express";
 import { say } from "./chatbox.js";
-import { queryBrainText, queryBrainVision } from "./brain.js";
-import { captureBase64 } from "./perception.js";
+import { queryBrainMessage } from "./brain.js";
 import { speak } from "./voice.js";
 
 
 //const IDLE_MESSAGE = "[ShinyShadow_'s AI Daughter] Talk to me via the web interface linked in my profile. (WIP: prompt her via voice)";
-const IDLE_MESSAGE = "[ShinyShadow_'s AI Daughter] How to talk to me: Either start your sentence with 'Lily' or via the web linked in my profile and I reply in game."
+const IDLE_MESSAGE = ""
 
 const IDLE_RESEND_INTERVAL_MS = 15000;
 const REPLY_HOLD_MS = 8500;
@@ -79,7 +78,7 @@ const PAGE = `
   <div id="log"></div>
  <h1> Info: <br> <br> </h1>
   <p> Via this web interface you can input prompts to her and she will reply in game. There is a 10 second global cooldown. <br> <br>
-      The screenshot option might take a bit longer to process.
+      The screenshot option might take a bit longer to process. If you wanna know more about Lily, check the whole project: https://github.com/Izan-Sola/Lily
  </p> <script>
     const msgEl = document.getElementById("msg");
     const logEl = document.getElementById("log");
@@ -139,11 +138,16 @@ export function startWebServer(port = 3000) {
     const text = (req.body?.text ?? "").trim();
     if (!text) return res.status(400).json({ error: "empty message" });
     console.log(`[chat] IN  (text): ${text}`);
-    const reply = await queryBrainText(text);
-    console.log(`[chat] OUT (text): ${reply}`);
-    showReplyThenRevert(reply);
-    speak(reply);
-    res.json({ reply });
+    try {
+      const reply = await queryBrainMessage("user", text);
+      console.log(`[chat] OUT (text): ${reply}`);
+      showReplyThenRevert(reply);
+      speak(reply);
+      res.json({ reply });
+    } catch (err) {
+      console.error(`[chat] text failed: ${err.message}`);
+      res.status(500).json({ error: "message processing failed" });
+    }
   });
 
   app.post("/api/vision", async (req, res) => {
@@ -155,8 +159,7 @@ export function startWebServer(port = 3000) {
     if (!text) return res.status(400).json({ error: "empty message" });
     console.log(`[chat] IN  (vision): ${text}`);
     try {
-      const imageBase64 = await captureBase64();
-      const reply = await queryBrainVision(text, imageBase64);
+      const reply = await queryBrainMessage("user", text, { withImage: true });
       console.log(`[chat] OUT (vision): ${reply}`);
       showReplyThenRevert(reply);
       speak(reply);

@@ -1,0 +1,25 @@
+{
+  "VRCHAT_SEND_PORT": 9000,
+  "VRCHAT_SEND_ADDRESS": "127.0.0.1",
+  "LOCAL_LISTEN_PORT": 9001,
+  "BRAIN_URL": "http://192.168.18.48:11435/v1/chat/completions",
+  "SCREENSHOT_PATH": "/tmp/lily_vr_frame.png",
+  "BUTTIN_MIN_MS": 60000,
+  "BUTTIN_MAX_MS": 120000,
+
+  "PYTHON_BIN": "/home/izansolaserver/Desktop/lilyvrchatstuff/.venv/bin/python3",
+  "AUDIO_MONITOR_SOURCE": "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor",
+  "AUDIO_CHUNK_SECONDS": 5,
+  "WHISPER_MODEL": "base.en",
+  "WHISPER_SERVER_URL": "http://192.168.18.48:8775/transcribe",
+  "VOICE_WAKE_WORD": ["little", "lee", "lily", "lili", "lilly", "lilí", "really", "leally", "leeli", "lil"],
+
+  "context": "",
+
+  "_notes": {
+    "_general": "This file is read live -- edit and save it and the app picks up changes immediately, no restart needed. JSON doesn't support comments, so notes live here instead.",
+    "AUDIO_MONITOR_SOURCE": "run `pactl list sources short` if this doesn't work",
+    "WHISPER_MODEL": "no longer used locally -- kept as a reminder of the old setting. Model choice now lives in whisper_server.py on the Zorin PC",
+    "context": "Free text appended to Lily's system prompt as a '# CURRENT CONTEXT' section, so she's aware of situational stuff -- e.g. what VRChat world/game you just entered, what's going on right now. Leave empty to omit it entirely. Edited live, same as everything else here."
+  }
+}
