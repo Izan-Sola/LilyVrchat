@@ -1,28 +1,40 @@
 import { spawn } from "child_process";
-import { unlink } from "fs/promises";
-import { nodewhisper } from "nodejs-whisper";
+import { unlink, readFile } from "fs/promises";
 import cfg from "./config.js";
 import { queryBrainText, queryBrainButtIn } from "./brain.js";
 import { handleReply, checkCooldown } from "./server.js";
 import { setStatus } from "./status.js";
 
 const realLog = (msg) => process.stdout.write(msg + "\n");
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let running = false;
 let chunkCounter = 0;
 let ambientBuffer = [];
+let lastTranscript = ""; // most recent non-empty ambient transcription -- backspace force-sends this
 let buttInTimer = null;
+let buttInEnabled = true;
+
+// -- timed (wake-word) chunk recording ---------------------------------
+let currentProc = null;
+let currentMode = null; // "timed" while a normal wake-word chunk is recording
+let discardNextResult = false;
+
+// -- manual (untimed) push-to-talk recording ---------------------------
+const MANUAL_AUDIO_PATH = "/tmp/lily_manual_audio.wav";
+let manualProc = null;
+let manualActive = false;
 
 function captureChunk(outPath, seconds, id) {
   return new Promise((resolve, reject) => {
     let remaining = seconds;
-    realLog(`[voice] #${id} recording... ${remaining}`);
+    realLog(`[voice] > Recording... ${remaining}`);
     setStatus(`Listening: ${remaining}s...`);
 
     const countdown = setInterval(() => {
       remaining--;
       if (remaining > 0) {
-        realLog(`[voice] #${id} recording... ${remaining}`);
+        realLog(`[voice] > Recording... ${remaining}`);
         setStatus(`Listening: ${remaining}s...`);
       }
     }, 1000);
@@ -37,28 +49,87 @@ function captureChunk(outPath, seconds, id) {
       outPath,
     ]);
 
-    proc.on("exit", () => { clearInterval(countdown); resolve(); });
-    proc.on("error", (err) => { clearInterval(countdown); reject(err); });
+    currentProc = proc;
+    currentMode = "timed";
+
+    proc.on("exit", () => {
+      clearInterval(countdown);
+      currentProc = null;
+      currentMode = null;
+      resolve();
+    });
+    proc.on("error", (err) => {
+      clearInterval(countdown);
+      currentProc = null;
+      currentMode = null;
+      reject(err);
+    });
   });
 }
 
-async function transcribe(wavPath) {
-  const originalWrite = process.stdout.write.bind(process.stdout);
-  process.stdout.write = () => true;
+// Cuts the current timed listening chunk short (spacebar pressed) so it
+// moves straight to processing instead of waiting out the countdown.
+// `timeout` (the wrapper process we spawned) forwards the signal down to
+// `parec`, same as it does when the countdown naturally expires.
+export function skipCurrentRecording() {
+  if (currentProc && currentMode === "timed") {
+    realLog("[voice] skip requested -- cutting listening short");
+    currentProc.kill("SIGTERM");
+  }
+}
 
+// Triggered by pressing Backspace in the terminal. Force-sends whatever
+// the last ambient chunk transcribed, no wake word or cooldown required --
+// sends unconditionally, same as the manual (Enter) path does.
+export async function forceSendLastTranscript() {
+  const text = lastTranscript;
+  if (!text) {
+    realLog("[voice] backspace pressed but nothing transcribed yet");
+    return;
+  }
+  lastTranscript = "";
+
+  realLog(`[voice] input (forced): ${text}`);
+  setStatus("Thinking...");
+  const reply = await queryBrainText(text);
+  realLog(`[voice] lily response (forced): ${reply}`);
+  await handleReply(reply);
+}
+
+// Same idea, but used when switching into manual recording: the
+// interrupted chunk gets thrown away instead of transcribed/processed.
+function interruptForManualMode() {
+  if (currentProc && currentMode === "timed") {
+    discardNextResult = true;
+    currentProc.kill("SIGTERM");
+  }
+}
+
+async function transcribe(wavPath) {
   try {
-    const result = await nodewhisper(wavPath, {
-      modelName: cfg.WHISPER_MODEL,
-      autoDownloadModelName: cfg.WHISPER_MODEL,
-      removeWavFileAfterTranscription: false,
-      withCuda: false,
-      whisperOptions: { outputInText: true, language: "en" },
+    const buf = await readFile(wavPath);
+    const form = new FormData();
+    form.append("file", new Blob([buf], { type: "audio/wav" }), "audio.wav");
+
+    const res = await fetch(cfg.WHISPER_SERVER_URL, {
+      method: "POST",
+      body: form,
     });
-    return (result ?? "").replace(/\n/g, " ").trim();
-  } catch {
+
+    if (!res.ok) {
+      realLog(`[voice] whisper server returned ${res.status}`);
+      return "";
+    }
+
+    const data = await res.json();
+    if (data.error) {
+      realLog(`[voice] whisper server error: ${data.error}`);
+      return "";
+    }
+    return (data.text ?? "").replace(/\n/g, " ").trim();
+  } catch (err) {
+    realLog(`[voice] transcription request failed: ${err.message}`);
     return "";
-  } finally {
-    process.stdout.write = originalWrite;
   }
 }
 
@@ -79,22 +150,35 @@ function extractWakeSentence(text) {
 
 async function loop() {
   while (running) {
+    if (manualActive) {
+      // yield the mic while a manual (untimed) recording is in progress
+      await sleep(200);
+      continue;
+    }
+
     const id = chunkCounter++;
     const path = `/tmp/lily_incoming_audio_${id}.wav`;
 
     await captureChunk(path, cfg.AUDIO_CHUNK_SECONDS, id);
 
-    realLog(`[voice] #${id} processing audio...`);
+    if (discardNextResult) {
+      discardNextResult = false;
+      await unlink(path).catch(() => {});
+      continue;
+    }
+
+    realLog(`[voice] > Processing audio...`);
     setStatus("Processing audio...");
     const rawText = await transcribe(path);
-    realLog(`[voice] #${id} processed audio.`);
+    realLog(`[voice] > Rrocessed audio.`);
     await unlink(path).catch(() => {});
 
     const text = cleanTranscript(rawText);
-    realLog(`[voice] #${id} heard: "${text}"`);
+    realLog(`[voice] > Reard: "${text}"`);
 
     if (text) {
       ambientBuffer.push(text);
+      lastTranscript = text;
 
       const trigger = extractWakeSentence(text);
       if (trigger) {
@@ -117,10 +201,15 @@ function scheduleNextButtIn() {
 }
 
 async function runButtInCheck() {
+  if (manualActive) {
+    scheduleNextButtIn();
+    return;
+  }
+
   const transcript = ambientBuffer.join(" ").trim();
   ambientBuffer = [];
 
-  if (transcript && checkCooldown() <= 0) {
+  if (buttInEnabled && transcript && checkCooldown() <= 0) {
     setStatus("Thinking...");
     const reply = await queryBrainButtIn(transcript);
     if (reply !== "NONE") {
@@ -130,6 +219,91 @@ async function runButtInCheck() {
   }
 
   scheduleNextButtIn();
+}
+
+// Toggled by pressing "b" in the terminal.
+export function toggleButtIn() {
+  buttInEnabled = !buttInEnabled;
+  realLog(`[voice] butt-in ${buttInEnabled ? "enabled" : "disabled"}`);
+  return buttInEnabled;
+}
+
+export function isButtInEnabled() {
+  return buttInEnabled;
+}
+
+// Toggled by pressing Enter on an empty line. Records with no timer at
+// all -- everything said between the two Enter presses gets transcribed
+// and sent straight to the brain, bypassing the wake word entirely.
+export async function toggleManualRecording() {
+  if (manualActive) {
+    await stopManualRecording();
+  } else {
+    startManualRecording();
+  }
+}
+
+export function isManualRecording() {
+  return manualActive;
+}
+
+function startManualRecording() {
+  if (manualActive) return;
+  manualActive = true;
+
+  // hand over the mic if a timed ambient chunk is mid-recording
+  interruptForManualMode();
+
+  realLog("[voice] manual recording started (press Enter to stop)...");
+  setStatus("Listening...");
+
+  manualProc = spawn("parec", [
+    "--file-format=wav",
+    "--channels=1",
+    "--rate=16000",
+    "-d", cfg.AUDIO_MONITOR_SOURCE,
+    MANUAL_AUDIO_PATH,
+  ]);
+  manualProc.on("error", (err) => {
+    realLog(`[voice] manual recording failed to start: ${err.message}`);
+    manualActive = false;
+    manualProc = null;
+  });
+}
+
+async function stopManualRecording() {
+  if (!manualActive || !manualProc) return;
+  const proc = manualProc;
+  manualProc = null;
+  // manualActive stays true through transcription + reply, same as the
+  // timed path staying inside its own await chain -- otherwise the ambient
+  // loop jumps in and starts a new chunk mid-processing.
+
+  realLog("[voice] manual recording stopped, processing...");
+  setStatus("Processing audio...");
+
+  await new Promise((resolve) => {
+    proc.once("exit", resolve);
+    proc.kill("SIGTERM");
+  });
+
+  const rawText = await transcribe(MANUAL_AUDIO_PATH);
+  await unlink(MANUAL_AUDIO_PATH).catch(() => {});
+  const text = cleanTranscript(rawText);
+  realLog(`[voice] manual heard: "${text}"`);
+
+  if (!text) {
+    realLog("[voice] manual recording was empty, nothing to send");
+    manualActive = false;
+    return;
+  }
+
+  realLog(`[voice] input (manual): ${text}`);
+  setStatus("Thinking...");
+  const reply = await queryBrainText(text);
+  realLog(`[voice] lily response (manual): ${reply}`);
+  await handleReply(reply);
+  manualActive = false;
 }
 
 export function startVoiceListener() {
@@ -142,4 +316,6 @@ export function startVoiceListener() {
 export function stopVoiceListener() {
   running = false;
   if (buttInTimer) clearTimeout(buttInTimer);
+  if (currentProc) currentProc.kill("SIGTERM");
+  if (manualProc) manualProc.kill("SIGTERM");
 }

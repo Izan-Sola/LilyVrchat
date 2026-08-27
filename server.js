@@ -1,22 +1,50 @@
 import express from "express";
-import { setStatus } from "./status.js";
+import { say } from "./chatbox.js";
 import { queryBrainText, queryBrainVision } from "./brain.js";
 import { captureBase64 } from "./perception.js";
 import { speak } from "./voice.js";
 
-const COOLDOWN_MS = 10000;
 
-// Pushes the reply to the chatbox (with title prefix, via setStatus) and
-// speaks it aloud. No idle message to manage anymore -- whatever's on the
-// chatbox just sits there until the next status update (next listening
-// cycle, next reply, etc.) overwrites it.
+//const IDLE_MESSAGE = "[ShinyShadow_'s AI Daughter] Talk to me via the web interface linked in my profile. (WIP: prompt her via voice)";
+const IDLE_MESSAGE = "[ShinyShadow_'s AI Daughter] How to talk to me: Either start your sentence with 'Lily' or via the web linked in my profile and I reply in game."
+
+const IDLE_RESEND_INTERVAL_MS = 15000;
+const REPLY_HOLD_MS = 8500;
+const COOLDOWN_MS = 10000;
 export function handleReply(reply) {
-  setStatus(reply);
+  stopIdleLoop();
+  if (replyTimer) clearTimeout(replyTimer);
+  say(reply);
   const speakPromise = speak(reply); // capture the promise instead of firing-and-forgetting
+  replyTimer = setTimeout(startIdleLoop, REPLY_HOLD_MS);
   return speakPromise;
 }
 export { checkCooldown };
+let idleInterval = null;
+let replyTimer = null;
 let lastSentAt = 0;
+
+export function showIdleMessage() {
+  say(IDLE_MESSAGE);
+}
+
+function startIdleLoop() {
+  stopIdleLoop();
+  showIdleMessage();
+  idleInterval = setInterval(showIdleMessage, IDLE_RESEND_INTERVAL_MS);
+}
+
+function stopIdleLoop() {
+  if (idleInterval) clearInterval(idleInterval);
+  idleInterval = null;
+}
+
+function showReplyThenRevert(reply) {
+  stopIdleLoop();
+  if (replyTimer) clearTimeout(replyTimer);
+  say(reply);
+  replyTimer = setTimeout(startIdleLoop, REPLY_HOLD_MS);
+}
 
 function checkCooldown() {
   const now = Date.now();
@@ -49,10 +77,10 @@ const PAGE = `
   <button id="sendText">Send</button>
   <button id="sendVision">Send + Screenshot of what SHE sees. </button>
   <div id="log"></div>
- <h1>READ THIS: <br> <br> </h1>
-  <p> Via this web interface you can input prompts to her and she will reply in game. There is a 10 second global cooldown <br> <br>
-  You can also speak to her in game by saying her name (Lily) in your sentence, but it can be inconsistent (not the best hardware on my side plus <br><br>
-  the noise/voices around can mess with the audio capture) </p> <script>
+ <h1> Info: <br> <br> </h1>
+  <p> Via this web interface you can input prompts to her and she will reply in game. There is a 10 second global cooldown. <br> <br>
+      The screenshot option might take a bit longer to process.
+ </p> <script>
     const msgEl = document.getElementById("msg");
     const logEl = document.getElementById("log");
 
@@ -99,6 +127,7 @@ const PAGE = `
 export function startWebServer(port = 3000) {
   const app = express();
   app.use(express.json());
+  startIdleLoop();
 
   app.get("/", (req, res) => res.send(PAGE));
 
@@ -110,10 +139,10 @@ export function startWebServer(port = 3000) {
     const text = (req.body?.text ?? "").trim();
     if (!text) return res.status(400).json({ error: "empty message" });
     console.log(`[chat] IN  (text): ${text}`);
-    setStatus("Thinking...");
     const reply = await queryBrainText(text);
     console.log(`[chat] OUT (text): ${reply}`);
-    handleReply(reply);
+    showReplyThenRevert(reply);
+    speak(reply);
     res.json({ reply });
   });
 
@@ -126,11 +155,11 @@ export function startWebServer(port = 3000) {
     if (!text) return res.status(400).json({ error: "empty message" });
     console.log(`[chat] IN  (vision): ${text}`);
     try {
-      setStatus("Looking + Thinking...");
       const imageBase64 = await captureBase64();
       const reply = await queryBrainVision(text, imageBase64);
       console.log(`[chat] OUT (vision): ${reply}`);
-      handleReply(reply);
+      showReplyThenRevert(reply);
+      speak(reply);
       res.json({ reply });
     } catch (err) {
       console.error(`[chat] vision failed: ${err.message}`);
