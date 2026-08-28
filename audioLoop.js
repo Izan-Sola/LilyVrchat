@@ -114,7 +114,7 @@ async function transcribe(wavPath) {
     const form = new FormData();
     form.append("file", new Blob([buf], { type: "audio/wav" }), "audio.wav");
 
-    const res = await fetch(cfg.WHISPER_SERVER_URL, {
+    const res = await fetch(cfg.WHISPER_SIDECAR_URL, {
       method: "POST",
       body: form,
     });
