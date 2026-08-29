@@ -1,119 +1,41 @@
 import { spawn } from "child_process";
 import { unlink, readFile } from "fs/promises";
+import { RealTimeVAD } from "@ericedouard/vad-node-realtime";
 import cfg from "./config.js";
-import { queryBrainMessage } from "./brain.js";
-import { handleReply, checkCooldown } from "./server.js";
-import { setStatus } from "./status.js";
+import { requestReply } from "./server.js";
+import { setStatus } from "./chatbox.js";
 
 const realLog = (msg) => process.stdout.write(msg + "\n");
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let running = false;
-let chunkCounter = 0;
 let ambientBuffer = [];
 let lastTranscript = ""; // most recent non-empty ambient transcription -- backspace/tab force-send this
 let buttInTimer = null;
 let buttInEnabled = true;
 
-// -- timed (wake-word) chunk recording ---------------------------------
-let currentProc = null;
-let currentMode = null; // "timed" while a normal wake-word chunk is recording
-let discardNextResult = false;
+// -- VAD-driven ambient listening ---------------------------------------
+// Replaces the old fixed-duration (AUDIO_CHUNK_SECONDS) recording loop.
+// A single parec process streams raw PCM continuously; Silero VAD (via
+// @ericedouard/vad-node-realtime) watches that stream and fires
+// onSpeechStart/onSpeechEnd around actual speech, so we only ever
+// transcribe real utterances instead of a fixed window that might cut
+// someone off or capture a bunch of silence.
+const VAD_SAMPLE_RATE = 16000;
+let vad = null;
+let ambientProc = null;
+let vadSpeaking = false;
+let carryByte = null; // holds a leftover odd byte between stdout chunks so 16-bit samples never split
+let discardNextResult = false; // set when manual mode interrupts an in-progress ambient utterance
 
-// -- manual (untimed) push-to-talk recording ---------------------------
+// -- manual (untimed) push-to-talk recording ----------------------------
 const MANUAL_AUDIO_PATH = "/tmp/lily_manual_audio.wav";
 let manualProc = null;
 let manualActive = false;
 
-function captureChunk(outPath, seconds, id) {
-  return new Promise((resolve, reject) => {
-    let remaining = seconds;
-    realLog(`[voice] > Recording... ${remaining}`);
-    setStatus(`Listening: ${remaining}s...`);
-
-    const countdown = setInterval(() => {
-      remaining--;
-      if (remaining > 0) {
-        realLog(`[voice] > Recording... ${remaining}`);
-        setStatus(`Listening: ${remaining}s...`);
-      }
-    }, 1000);
-
-    const proc = spawn("timeout", [
-      `${seconds}s`,
-      "parec",
-      "--file-format=wav",
-      "--channels=1",
-      "--rate=16000",
-      "-d", cfg.AUDIO_MONITOR_SOURCE,
-      outPath,
-    ]);
-
-    currentProc = proc;
-    currentMode = "timed";
-
-    proc.on("exit", () => {
-      clearInterval(countdown);
-      currentProc = null;
-      currentMode = null;
-      resolve();
-    });
-    proc.on("error", (err) => {
-      clearInterval(countdown);
-      currentProc = null;
-      currentMode = null;
-      reject(err);
-    });
-  });
-}
-
-// Cuts the current timed listening chunk short (spacebar pressed) so it
-// moves straight to processing instead of waiting out the countdown.
-// `timeout` (the wrapper process we spawned) forwards the signal down to
-// `parec`, same as it does when the countdown naturally expires.
-export function skipCurrentRecording() {
-  if (currentProc && currentMode === "timed") {
-    realLog("[voice] skip requested -- cutting listening short");
-    currentProc.kill("SIGTERM");
-  }
-}
-
-// Triggered by pressing Backspace (no image) or Tab (with image) in the
-// terminal. Force-sends whatever the last ambient chunk transcribed, no
-// wake word or cooldown required -- sends unconditionally, same as the
-// manual (Enter) path does. `withImage` opts into a screenshot for this
-// one forced send only; the regular voice paths stay text-only since
-// attaching a screenshot every turn was too slow for live back-and-forth.
-export async function forceSendLastTranscript(withImage = false) {
-  const text = lastTranscript;
-  if (!text) {
-    realLog(`[voice] force-send pressed but nothing transcribed yet`);
-    return;
-  }
-  lastTranscript = "";
-
-  realLog(`[voice] input (forced${withImage ? " +image" : ""}): ${text}`);
-  setStatus(withImage ? "Thinking (with image)..." : "Thinking...");
-  const reply = await queryBrainMessage("user", text, { withImage });
-  realLog(`[voice] lily response (forced): ${reply}`);
-  await handleReply(reply);
-}
-
-// Same idea, but used when switching into manual recording: the
-// interrupted chunk gets thrown away instead of transcribed/processed.
-function interruptForManualMode() {
-  if (currentProc && currentMode === "timed") {
-    discardNextResult = true;
-    currentProc.kill("SIGTERM");
-  }
-}
-
-async function transcribe(wavPath) {
+// -- Whisper sidecar ------------------------------------------------------
+async function sendToWhisper(form) {
   try {
-    const buf = await readFile(wavPath);
-    const form = new FormData();
-    form.append("file", new Blob([buf], { type: "audio/wav" }), "audio.wav");
-
     const res = await fetch(cfg.WHISPER_SIDECAR_URL, {
       method: "POST",
       body: form,
@@ -136,6 +58,19 @@ async function transcribe(wavPath) {
   }
 }
 
+async function transcribe(wavPath) {
+  const buf = await readFile(wavPath);
+  const form = new FormData();
+  form.append("file", new Blob([buf], { type: "audio/wav" }), "audio.wav");
+  return sendToWhisper(form);
+}
+
+async function transcribeBuffer(wavBuffer) {
+  const form = new FormData();
+  form.append("file", new Blob([wavBuffer], { type: "audio/wav" }), "audio.wav");
+  return sendToWhisper(form);
+}
+
 function cleanTranscript(text) {
   return text.replace(/\[.*?\]/g, "").replace(/\(.*?\)/g, "").trim();
 }
@@ -151,51 +86,198 @@ function extractWakeSentence(text) {
   return null;
 }
 
-async function loop() {
-  while (running) {
-    if (manualActive) {
-      // yield the mic while a manual (untimed) recording is in progress
-      await sleep(200);
-      continue;
-    }
+// Wraps 16-bit PCM samples (what the VAD hands back) in a minimal WAV
+// header so they can go straight to the whisper sidecar without ever
+// touching disk.
+function floatToWav(float32Audio, sampleRate = VAD_SAMPLE_RATE) {
+  const pcm16 = new Int16Array(float32Audio.length);
+  for (let i = 0; i < float32Audio.length; i++) {
+    const s = Math.max(-1, Math.min(1, float32Audio[i]));
+    pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
 
-    const id = chunkCounter++;
-    const path = `/tmp/lily_incoming_audio_${id}.wav`;
+  const dataSize = pcm16.length * 2;
+  const buffer = Buffer.alloc(44 + dataSize);
+  buffer.write("RIFF", 0);
+  buffer.writeUInt32LE(36 + dataSize, 4);
+  buffer.write("WAVE", 8);
+  buffer.write("fmt ", 12);
+  buffer.writeUInt32LE(16, 16);
+  buffer.writeUInt16LE(1, 20); // PCM
+  buffer.writeUInt16LE(1, 22); // mono
+  buffer.writeUInt32LE(sampleRate, 24);
+  buffer.writeUInt32LE(sampleRate * 2, 28); // byte rate
+  buffer.writeUInt16LE(2, 32); // block align
+  buffer.writeUInt16LE(16, 34); // bits per sample
+  buffer.write("data", 36);
+  buffer.writeUInt32LE(dataSize, 40);
+  Buffer.from(pcm16.buffer, pcm16.byteOffset, pcm16.byteLength).copy(buffer, 44);
+  return buffer;
+}
 
-    await captureChunk(path, cfg.AUDIO_CHUNK_SECONDS, id);
+function int16BufferToFloat32(buf) {
+  const sampleCount = buf.length >> 1;
+  const out = new Float32Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    const sample = buf.readInt16LE(i * 2);
+    out[i] = sample / (sample < 0 ? 0x8000 : 0x7fff);
+  }
+  return out;
+}
 
-    if (discardNextResult) {
-      discardNextResult = false;
-      await unlink(path).catch(() => {});
-      continue;
-    }
+// Triggered by pressing Backspace (no image) or Tab (with image) in the
+// terminal. Force-sends whatever the last ambient chunk transcribed, no
+// wake word or cooldown required -- sends unconditionally, same as the
+// manual (Enter) path does. `withImage` opts into a screenshot for this
+// one forced send only; the regular voice paths stay text-only since
+// attaching a screenshot every turn was too slow for live back-and-forth.
+export async function forceSendLastTranscript(withImage = false) {
+  const text = lastTranscript;
+  if (!text) {
+    realLog(`[voice] force-send pressed but nothing transcribed yet`);
+    return;
+  }
+  lastTranscript = "";
 
-    realLog(`[voice] > Processing audio...`);
-    setStatus("Processing audio...");
-    const rawText = await transcribe(path);
-    realLog(`[voice] > Processed audio.`);
-    await unlink(path).catch(() => {});
+  realLog(`[voice] input (forced${withImage ? " +image" : ""}): ${text}`);
+  const { reply, error } = await requestReply("user", text, { withImage, bypassCooldown: true });
+  if (error) {
+    realLog(`[voice] force-send skipped: ${error}`);
+    return;
+  }
+  realLog(`[voice] lily response (forced): ${reply}`);
+}
 
-    const text = cleanTranscript(rawText);
-    realLog(`[voice] > Heard: "${text}"`);
+// Cuts the current in-progress ambient utterance short (spacebar pressed)
+// instead of waiting for the VAD's own silence/redemption window to
+// finalize it. flush() asks the VAD to process whatever it's buffered so
+// far, which finalizes the segment and fires onSpeechEnd with it -- same
+// spirit as the old "kill the timed recording early" behaviour, just
+// driven by the VAD instead of a countdown.
+export function skipCurrentRecording() {
+  if (vad && vadSpeaking) {
+    realLog("[voice] skip requested -- finalizing current speech now");
+    vad.flush().catch((err) => realLog(`[voice] flush failed: ${err.message}`));
+  }
+}
 
-    if (text) {
-      ambientBuffer.push(text);
-      lastTranscript = text;
+// Same idea, but used when switching into manual recording: whatever the
+// VAD was mid-way through hearing gets thrown away instead of
+// transcribed/processed.
+function interruptForManualMode() {
+  if (vad && vadSpeaking) {
+    discardNextResult = true;
+    vad.flush().catch(() => {});
+  }
+}
 
-      const trigger = extractWakeSentence(text);
-      if (trigger) {
-        const remaining = checkCooldown();
-        if (remaining <= 0) {
-          realLog(`[voice] input: ${trigger}`);
-          setStatus("Thinking...");
-          const reply = await queryBrainMessage("user", trigger);
-          realLog(`[voice] lily response: ${reply}`);
-          await handleReply(reply); // wait for her to actually finish speaking before looping
-        }
-      }
+async function handleSpeechStart() {
+  if (manualActive) return; // ambient stream is paused while push-to-talk owns the mic
+  vadSpeaking = true;
+  realLog("[voice] > speech detected, listening...");
+  setStatus("Listening...");
+}
+
+async function handleSpeechEnd(float32Audio) {
+  vadSpeaking = false;
+
+  if (manualActive || discardNextResult) {
+    discardNextResult = false;
+    return;
+  }
+
+  realLog(`[voice] > Processing audio...`);
+  setStatus("Processing audio...");
+  const rawText = await transcribeBuffer(floatToWav(float32Audio));
+  realLog(`[voice] > Processed audio.`);
+
+  const text = cleanTranscript(rawText);
+  realLog(`[voice] > Heard: "${text}"`);
+  if (!text) return;
+
+  ambientBuffer.push(text);
+  lastTranscript = text;
+
+  const trigger = extractWakeSentence(text);
+  if (trigger) {
+    realLog(`[voice] input: ${trigger}`);
+    const { reply, error } = await requestReply("user", trigger); // waits for her to actually finish speaking before looping
+    if (error) {
+      realLog(`[voice] wake-word trigger skipped: ${error}`);
+    } else {
+      realLog(`[voice] lily response: ${reply}`);
     }
   }
+}
+
+async function initVad() {
+  vad = await RealTimeVAD.new({
+    // tune via config.json -- sane Silero defaults if unset
+    positiveSpeechThreshold: cfg.VAD_POSITIVE_THRESHOLD ?? 0.6,
+    negativeSpeechThreshold: cfg.VAD_NEGATIVE_THRESHOLD ?? 0.4,
+    minSpeechFrames: cfg.VAD_MIN_SPEECH_FRAMES ?? 4,
+    // How many consecutive below-threshold frames it waits through before
+    // deciding speech has actually ended and firing onSpeechEnd. frameSamples
+    // defaults to 1536 (~96ms/frame @16kHz), so 8 frames is roughly 0.75s of
+    // silence. Lower = snappier but risks cutting mid-sentence pauses; higher
+    // = more patient but adds latency before she responds.
+    redemptionFrames: cfg.VAD_REDEMPTION_FRAMES ?? 8,
+    // onSpeechStart only fires once minSpeechFrames worth of audio has
+    // already scored as speech, so without padding the segment handed to
+    // onSpeechEnd is missing whatever was said during that confirmation
+    // window -- clipped sentence starts. preSpeechPadFrames prepends that
+    // many already-buffered frames from before the detected onset back
+    // onto the segment. frameSamples defaults to 1536 (~96ms/frame @16kHz),
+    // so 12 frames covers a little over 1s of lead-in; trim it down if
+    // replies start feeling like they're reacting to dead air.
+    preSpeechPadFrames: cfg.VAD_PRE_SPEECH_PAD_FRAMES ?? 12,
+    onSpeechStart: handleSpeechStart,
+    onSpeechEnd: handleSpeechEnd,
+  });
+  vad.start();
+}
+
+// Persistent raw-PCM stream from the same monitor source the old timed
+// chunks used. PulseAudio monitor sources support multiple simultaneous
+// readers, so this runs alongside the separate manual-recording parec
+// process fine -- we just drop ambient chunks while manual mode owns the
+// turn (see the `manualActive` check below) instead of tearing this down.
+function startAmbientStream() {
+  ambientProc = spawn("parec", [
+    "--channels=1",
+    "--rate=16000",
+    "--format=s16le",
+    "-d", cfg.AUDIO_MONITOR_SOURCE,
+  ]);
+
+  ambientProc.stdout.on("data", (chunk) => {
+    if (carryByte !== null) {
+      chunk = Buffer.concat([carryByte, chunk]);
+      carryByte = null;
+    }
+    if (chunk.length % 2 !== 0) {
+      carryByte = Buffer.from(chunk.subarray(chunk.length - 1));
+      chunk = chunk.subarray(0, chunk.length - 1);
+    }
+
+    if (manualActive || !vad) return;
+
+    vad.processAudio(int16BufferToFloat32(chunk)).catch((err) => {
+      realLog(`[voice] VAD processing error: ${err.message}`);
+    });
+  });
+
+  ambientProc.on("error", (err) => {
+    realLog(`[voice] ambient parec failed to start: ${err.message}`);
+  });
+
+  ambientProc.on("exit", (code) => {
+    ambientProc = null;
+    if (running) {
+      realLog(`[voice] ambient parec exited (code ${code}), restarting...`);
+      setTimeout(startAmbientStream, 500);
+    }
+  });
 }
 
 function scheduleNextButtIn() {
@@ -212,12 +294,10 @@ async function runButtInCheck() {
   const transcript = ambientBuffer.join(" ").trim();
   ambientBuffer = [];
 
-  if (buttInEnabled && transcript && checkCooldown() <= 0) {
-    setStatus("Thinking...");
-    const reply = await queryBrainMessage("ambient", transcript);
-    if (reply !== "NONE") {
+  if (buttInEnabled && transcript) {
+    const { reply, error } = await requestReply("ambient", transcript);
+    if (!error && reply && reply !== "NONE") {
       realLog(`[voice] butt-in: ${reply}`);
-      await handleReply(reply);
     }
   }
 
@@ -254,7 +334,7 @@ function startManualRecording() {
   if (manualActive) return;
   manualActive = true;
 
-  // hand over the mic if a timed ambient chunk is mid-recording
+  // hand over the mic if the VAD is mid-way through an ambient utterance
   interruptForManualMode();
 
   realLog("[voice] manual recording started (press Enter to stop)...");
@@ -280,7 +360,7 @@ async function stopManualRecording() {
   manualProc = null;
   // manualActive stays true through transcription + reply, same as the
   // timed path staying inside its own await chain -- otherwise the ambient
-  // loop jumps in and starts a new chunk mid-processing.
+  // stream jumps in and starts feeding a new utterance mid-processing.
 
   realLog("[voice] manual recording stopped, processing...");
   setStatus("Processing audio...");
@@ -302,23 +382,27 @@ async function stopManualRecording() {
   }
 
   realLog(`[voice] input (manual): ${text}`);
-  setStatus("Thinking...");
-  const reply = await queryBrainMessage("user", text);
-  realLog(`[voice] lily response (manual): ${reply}`);
-  await handleReply(reply);
+  const { reply, error } = await requestReply("user", text, { bypassCooldown: true });
+  if (error) {
+    realLog(`[voice] manual send skipped: ${error}`);
+  } else {
+    realLog(`[voice] lily response (manual): ${reply}`);
+  }
   manualActive = false;
 }
 
-export function startVoiceListener() {
+export async function startVoiceListener() {
   running = true;
-  realLog(`[voice] listening for "${cfg.VOICE_WAKE_WORD}"...`);
-  loop();
+  await initVad();
+  startAmbientStream();
+  realLog(`[voice] listening for "${cfg.VOICE_WAKE_WORD}"... (VAD mode)`);
   scheduleNextButtIn();
 }
 
 export function stopVoiceListener() {
   running = false;
   if (buttInTimer) clearTimeout(buttInTimer);
-  if (currentProc) currentProc.kill("SIGTERM");
+  if (ambientProc) ambientProc.kill("SIGTERM");
   if (manualProc) manualProc.kill("SIGTERM");
+  if (vad) vad.destroy();
 }

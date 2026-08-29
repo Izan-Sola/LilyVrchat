@@ -2,41 +2,68 @@ import { spawn } from "child_process";
 import cfg from "./config.js";
 
 const SINK_NAME = "lily_voice";
-const SAMPLE_RATE = 24000; // must match xtts_server.py's SAMPLE_RATE
+const SAMPLE_RATE = 24000; // edge-tts's default output rate for most neural voices
+
+// Which edge-tts voice to speak with -- set EDGE_TTS_VOICE in config.json
+// to override. Run `edge-tts --list-voices` to see all options; anything
+// like "en-US-AvaNeural", "en-US-AnaNeural" (younger-sounding), or a
+// non-English voice all work the same way.
+const DEFAULT_VOICE = "en-US-AnaNeural";
+
+// The pipeline lock in server.js (requestReply/pipelineBusy) should
+// already guarantee speak() is never called while a previous call is
+// still playing. These track the in-flight processes anyway as a second
+// line of defense -- if that guarantee is ever violated, we tear down the
+// old pipeline instead of letting two audio streams overlap.
+let activePlayer = null;
+let activeUpstream = []; // [synth, decoder] -- killed alongside activePlayer
 
 function sanitizeInput(text) {
   return text.replace(/[\r\n]+/g, " ").trim();
-  // No shell-escaping needed here anymore -- this used to strip apostrophes
-  // (via brain.js's fixEscapedApostrophes) to survive being passed as a CLI
-  // arg to edge-tts. Now the text goes over HTTP as a JSON body instead, so
-  // that concern doesn't apply to the voice pipeline anymore -- fixEscapedApostrophes
-  // is still applied upstream in brain.js though, since that also touches the
-  // chatbox text, which is a separate decision.
+  // No shell-escaping needed -- spawn() below passes args straight to
+  // execve (no shell:true), so apostrophes/quotes in the text are safe
+  // as-is; this is just cleaning up line breaks so edge-tts gets one
+  // continuous utterance.
 }
 
-// Streams from the local XTTS sidecar (see xtts_server.py) and plays the
-// audio as it arrives -- this is what gets Lily talking before the whole
-// reply has finished generating, instead of waiting on one big file.
+function killActive() {
+  activeUpstream.forEach((p) => p.kill("SIGTERM"));
+  if (activePlayer) activePlayer.kill("SIGTERM");
+  activeUpstream = [];
+  activePlayer = null;
+}
+
+// Three chained processes, piped stdout->stdin, so playback can start
+// before the whole utterance has finished synthesizing (same "start
+// talking before the full reply is ready" goal the old XTTS streaming
+// path had):
+//   edge-tts --write-media -   (streams mp3 bytes to stdout as it synths)
+//     -> ffmpeg (decodes mp3 -> raw s16le PCM on the fly)
+//       -> paplay (plays the raw PCM on the lily_voice sink)
 export async function speak(text) {
   const clean = sanitizeInput(text);
   if (!clean) return;
 
-  let res;
-  try {
-    res = await fetch(cfg.VOICE_SIDECAR_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: clean }),
-    });
-  } catch (err) {
-    console.error("[voice] couldn't reach xtts_server:", err.message);
-    return;
+  if (activePlayer) {
+    console.warn("[voice] speak() called while already playing -- stopping previous playback");
+    killActive();
   }
 
-  if (!res.ok || !res.body) {
-    console.error(`[voice] speak failed: xtts_server returned ${res.status}`);
-    return;
-  }
+    const voice =  DEFAULT_VOICE;
+    const rate = "+20%"
+    const synth = spawn("edge-tts", ["--voice", voice, "--rate", rate, "--text", clean, "--write-media", "-"]);
+    synth.on("error", (err) => console.error("[voice] edge-tts failed to start:", err.message));
+    synth.stderr.on("data", () => {}); // edge-tts logs progress to stderr -- noise, ignore
+
+  const decoder = spawn("ffmpeg", [
+    "-loglevel", "error",
+    "-i", "pipe:0",
+    "-f", "s16le",
+    "-ar", String(SAMPLE_RATE),
+    "-ac", "1",
+    "pipe:1",
+  ]);
+  decoder.on("error", (err) => console.error("[voice] ffmpeg failed to start:", err.message));
 
   const player = spawn("paplay", [
     "--raw",
@@ -47,18 +74,14 @@ export async function speak(text) {
   ]);
   player.on("error", (err) => console.error("[voice] paplay failed to start:", err.message));
 
-  const reader = res.body.getReader();
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      player.stdin.write(Buffer.from(value));
-    }
-  } catch (err) {
-    console.error("[voice] stream read failed:", err.message);
-  } finally {
-    player.stdin.end();
-  }
+  synth.stdout.pipe(decoder.stdin);
+  decoder.stdout.pipe(player.stdin);
+
+  activeUpstream = [synth, decoder];
+  activePlayer = player;
 
   await new Promise((resolve) => player.on("exit", resolve));
+
+  if (activePlayer === player) activePlayer = null;
+  if (activeUpstream[0] === synth) activeUpstream = [];
 }

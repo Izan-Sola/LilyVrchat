@@ -1,5 +1,7 @@
 import { send } from "./osc.js";
 
+const STATUS_TITLE = "[Lily]";
+
 export function say(text, { immediate = true, sfx = false } = {}) {
   if (!text) return;
   const clipped = text.length > 144 ? text.slice(0, 141) + "..." : text;
@@ -8,4 +10,8 @@ export function say(text, { immediate = true, sfx = false } = {}) {
     { type: "i", value: immediate ? 1 : 0 },
     { type: "i", value: sfx ? 1 : 0 },
   ]);
+}
+
+export function setStatus(line) {
+  say(`${STATUS_TITLE}\n${line}`);
 }

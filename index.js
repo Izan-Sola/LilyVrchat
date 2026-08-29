@@ -1,8 +1,7 @@
 import readline from "readline";
 import { initOsc } from "./osc.js";
-import { queryBrainMessage } from "./brain.js";
 import { triggerAvatarActionById } from "./avatarActions.js";
-import { startWebServer, handleReply } from "./server.js";
+import { startWebServer, requestReply } from "./server.js";
 import { startVoiceListener, skipCurrentRecording, toggleManualRecording, toggleButtIn, forceSendLastTranscript } from "./audioLoop.js";
 
 initOsc();
@@ -71,9 +70,11 @@ rl.on("line", async (line) => {
   // behave the same -- !+ is kept around as a familiar alias.
   const text = raw.startsWith("!+") ? raw.slice(2).trim() : raw.slice(1).trim();
   console.log("(capturing screenshot...)");
-  const reply = await queryBrainMessage("user", text, { withImage: true });
-
-  handleReply(reply);
+  const { reply, error } = await requestReply("user", text, { withImage: true });
+  if (error) {
+    console.log(`(skipped: ${error})`);
+    return;
+  }
   console.log(`Lily: ${reply}`);
 });
 

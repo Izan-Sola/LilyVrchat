@@ -1,6 +1,6 @@
 import { say } from "./chatbox.js";
 
-const TITLE = "[Lily - Details in bio]";
+const TITLE = "[Lily]";
 
 // Pushes a two-line status update to the VRChat chatbox: the fixed title
 // on top, and whatever's happening right now underneath -- mirrors the

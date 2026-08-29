@@ -1,30 +1,34 @@
 import express from "express";
-import { say } from "./chatbox.js";
+import { setStatus } from "./chatbox.js";
 import { queryBrainMessage } from "./brain.js";
 import { speak } from "./voice.js";
 
-
 //const IDLE_MESSAGE = "[ShinyShadow_'s AI Daughter] Talk to me via the web interface linked in my profile. (WIP: prompt her via voice)";
-const IDLE_MESSAGE = ""
+const IDLE_MESSAGE = "";
 
 const IDLE_RESEND_INTERVAL_MS = 15000;
 const REPLY_HOLD_MS = 8500;
 const COOLDOWN_MS = 10000;
-export function handleReply(reply) {
-  stopIdleLoop();
-  if (replyTimer) clearTimeout(replyTimer);
-  say(reply);
-  const speakPromise = speak(reply); // capture the promise instead of firing-and-forgetting
-  replyTimer = setTimeout(startIdleLoop, REPLY_HOLD_MS);
-  return speakPromise;
-}
-export { checkCooldown };
+
 let idleInterval = null;
 let replyTimer = null;
 let lastSentAt = 0;
 
+// True from the moment a reply pipeline starts (the brain query) until
+// speak() has finished playing. This is the single source of truth that
+// stops two replies from overlapping -- everything that can trigger a
+// reply (wake word, butt-in, manual recording, force-send, terminal
+// `!text`, the web console) goes through requestReply() below instead of
+// separately calling queryBrainMessage + handleReply, so this flag is
+// always accurate no matter which path fired.
+let pipelineBusy = false;
+
+export function isBusy() {
+  return pipelineBusy;
+}
+
 export function showIdleMessage() {
-  say(IDLE_MESSAGE);
+  setStatus(IDLE_MESSAGE);
 }
 
 function startIdleLoop() {
@@ -38,21 +42,62 @@ function stopIdleLoop() {
   idleInterval = null;
 }
 
-function showReplyThenRevert(reply) {
+// Sets the chatbox to the reply and speaks it, then reverts to idle after
+// REPLY_HOLD_MS. This is the ONLY place speak() is called from -- every
+// caller goes through requestReply(), which holds `pipelineBusy` for the
+// whole span so a second pipeline can never start (and therefore never
+// call speak()) while this one is still running.
+async function handleReply(reply) {
   stopIdleLoop();
   if (replyTimer) clearTimeout(replyTimer);
-  say(reply);
+  setStatus(reply);
+  await speak(reply);
   replyTimer = setTimeout(startIdleLoop, REPLY_HOLD_MS);
 }
 
-function checkCooldown() {
-  const now = Date.now();
-  const elapsed = now - lastSentAt;
-  if (elapsed < COOLDOWN_MS) {
-    return Math.ceil((COOLDOWN_MS - elapsed) / 1000);
+function timeRemaining() {
+  const elapsed = Date.now() - lastSentAt;
+  return elapsed < COOLDOWN_MS ? Math.ceil((COOLDOWN_MS - elapsed) / 1000) : 0;
+}
+
+// Single entry point for every reply pipeline in the app. Replaces the old
+// pattern where audioLoop.js, index.js, and the web routes each separately
+// checked checkCooldown(), called queryBrainMessage(), then called
+// handleReply() themselves -- that duplication is exactly what let two
+// pipelines run at once (e.g. a wake-word reply still mid-speak() while a
+// force-send or a web request slipped past its own independent check).
+//
+// Returns { reply } on success (reply may be "NONE" for a deliberate
+// ambient non-reaction), or { error } if the request was turned away.
+//
+// `bypassCooldown` skips the *time* cooldown -- used by the manual/
+// force-send keys, which are meant to feel instant once she's free -- but
+// it never skips the busy lock, so those paths still can't talk over an
+// in-flight reply, they just don't have to wait out the full window once
+// one finishes.
+export async function requestReply(situation, text, { withImage = false, bypassCooldown = false } = {}) {
+  if (pipelineBusy) {
+    return { error: "still speaking, one sec" };
   }
-  lastSentAt = now;
-  return 0;
+  if (!bypassCooldown) {
+    const remaining = timeRemaining();
+    if (remaining > 0) {
+      return { error: `Cooldown active, wait ${remaining}s` };
+    }
+  }
+
+  pipelineBusy = true;
+  lastSentAt = Date.now();
+  setStatus(withImage ? "Thinking (with image)..." : "Thinking...");
+  try {
+    const reply = await queryBrainMessage(situation, text, { withImage });
+    if (reply !== "NONE") {
+      await handleReply(reply);
+    }
+    return { reply };
+  } finally {
+    pipelineBusy = false;
+  }
 }
 
 const PAGE = `
@@ -131,18 +176,13 @@ export function startWebServer(port = 3000) {
   app.get("/", (req, res) => res.send(PAGE));
 
   app.post("/api/text", async (req, res) => {
-    const remaining = checkCooldown();
-    if (remaining > 0) {
-      return res.status(429).json({ error: `Cooldown active, wait ${remaining}s` });
-    }
     const text = (req.body?.text ?? "").trim();
     if (!text) return res.status(400).json({ error: "empty message" });
     console.log(`[chat] IN  (text): ${text}`);
     try {
-      const reply = await queryBrainMessage("user", text);
+      const { reply, error } = await requestReply("user", text);
+      if (error) return res.status(429).json({ error });
       console.log(`[chat] OUT (text): ${reply}`);
-      showReplyThenRevert(reply);
-      speak(reply);
       res.json({ reply });
     } catch (err) {
       console.error(`[chat] text failed: ${err.message}`);
@@ -151,18 +191,13 @@ export function startWebServer(port = 3000) {
   });
 
   app.post("/api/vision", async (req, res) => {
-    const remaining = checkCooldown();
-    if (remaining > 0) {
-      return res.status(429).json({ error: `Cooldown active, wait ${remaining}s` });
-    }
     const text = (req.body?.text ?? "").trim();
     if (!text) return res.status(400).json({ error: "empty message" });
     console.log(`[chat] IN  (vision): ${text}`);
     try {
-      const reply = await queryBrainMessage("user", text, { withImage: true });
+      const { reply, error } = await requestReply("user", text, { withImage: true });
+      if (error) return res.status(429).json({ error });
       console.log(`[chat] OUT (vision): ${reply}`);
-      showReplyThenRevert(reply);
-      speak(reply);
       res.json({ reply });
     } catch (err) {
       console.error(`[chat] vision failed: ${err.message}`);
