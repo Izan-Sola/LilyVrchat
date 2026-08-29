@@ -10,27 +10,60 @@ const SAMPLE_RATE = 24000; // edge-tts's default output rate for most neural voi
 // non-English voice all work the same way.
 const DEFAULT_VOICE = "en-US-AnaNeural";
 
+// Which backend to speak with. Set TTS_ENGINE in config.json to
+// "edge-tts" or "xtts". Defaults to "edge-tts" if unset.
+const TTS_ENGINE = (cfg.TTS_ENGINE || "edge-tts").toLowerCase();
+
 // The pipeline lock in server.js (requestReply/pipelineBusy) should
 // already guarantee speak() is never called while a previous call is
 // still playing. These track the in-flight processes anyway as a second
 // line of defense -- if that guarantee is ever violated, we tear down the
 // old pipeline instead of letting two audio streams overlap.
 let activePlayer = null;
-let activeUpstream = []; // [synth, decoder] -- killed alongside activePlayer
+let activeUpstream = []; // subprocesses feeding activePlayer -- killed alongside it
+let activeAbort = null; // AbortController for an in-flight xtts fetch, if any
 
 function sanitizeInput(text) {
   return text.replace(/[\r\n]+/g, " ").trim();
   // No shell-escaping needed -- spawn() below passes args straight to
   // execve (no shell:true), so apostrophes/quotes in the text are safe
-  // as-is; this is just cleaning up line breaks so edge-tts gets one
-  // continuous utterance.
+  // as-is; this is just cleaning up line breaks so the TTS backend gets
+  // one continuous utterance.
 }
 
 function killActive() {
   activeUpstream.forEach((p) => p.kill("SIGTERM"));
   if (activePlayer) activePlayer.kill("SIGTERM");
+  if (activeAbort) activeAbort.abort();
   activeUpstream = [];
   activePlayer = null;
+  activeAbort = null;
+}
+
+// Plays raw s16le PCM (already decoded) through paplay on the lily_voice sink.
+// Returns a promise that resolves when playback finishes. Used by the
+// edge-tts path (ffmpeg decodes mp3 into this); xtts skips this and pipes
+// its own paplay directly since the sidecar already outputs raw PCM.
+function playPcmStream(pcmStream) {
+  const player = spawn("paplay", [
+    "--raw",
+    `--rate=${SAMPLE_RATE}`,
+    "--format=s16le",
+    "--channels=1",
+    `--device=${SINK_NAME}`,
+  ]);
+  player.on("error", (err) => console.error("[voice] paplay failed to start:", err.message));
+
+  pcmStream.pipe(player.stdin);
+
+  activePlayer = player;
+
+  return new Promise((resolve) => {
+    player.on("exit", () => {
+      if (activePlayer === player) activePlayer = null;
+      resolve();
+    });
+  });
 }
 
 // Three chained processes, piped stdout->stdin, so playback can start
@@ -40,20 +73,12 @@ function killActive() {
 //   edge-tts --write-media -   (streams mp3 bytes to stdout as it synths)
 //     -> ffmpeg (decodes mp3 -> raw s16le PCM on the fly)
 //       -> paplay (plays the raw PCM on the lily_voice sink)
-export async function speak(text) {
-  const clean = sanitizeInput(text);
-  if (!clean) return;
-
-  if (activePlayer) {
-    console.warn("[voice] speak() called while already playing -- stopping previous playback");
-    killActive();
-  }
-
-    const voice =  DEFAULT_VOICE;
-    const rate = "+20%"
-    const synth = spawn("edge-tts", ["--voice", voice, "--rate", rate, "--text", clean, "--write-media", "-"]);
-    synth.on("error", (err) => console.error("[voice] edge-tts failed to start:", err.message));
-    synth.stderr.on("data", () => {}); // edge-tts logs progress to stderr -- noise, ignore
+async function speakEdgeTts(clean) {
+  const voice = cfg.EDGE_TTS_VOICE || DEFAULT_VOICE;
+  const rate = cfg.EDGE_TTS_RATE || "+20%";
+  const synth = spawn("edge-tts", ["--voice", voice, "--rate", rate, "--text", clean, "--write-media", "-"]);
+  synth.on("error", (err) => console.error("[voice] edge-tts failed to start:", err.message));
+  synth.stderr.on("data", () => {}); // edge-tts logs progress to stderr -- noise, ignore
 
   const decoder = spawn("ffmpeg", [
     "-loglevel", "error",
@@ -65,6 +90,27 @@ export async function speak(text) {
   ]);
   decoder.on("error", (err) => console.error("[voice] ffmpeg failed to start:", err.message));
 
+  synth.stdout.pipe(decoder.stdin);
+
+  activeUpstream = [synth, decoder];
+
+  await playPcmStream(decoder.stdout);
+
+  if (activeUpstream[0] === synth) activeUpstream = [];
+}
+
+// Hits the XTTS sidecar server (VOICE_SIDECAR_URL, POST /speak) for
+// synthesis. The sidecar streams back raw s16le PCM mono at SAMPLE_RATE
+// directly -- no container/codec, so unlike edge-tts this skips ffmpeg
+// entirely and feeds paplay straight from the HTTP response body. Speaker
+// and language are fixed server-side (baked into the sidecar's startup
+// conditioning latents), so the request body is just { text }.
+async function speakXtts(clean) {
+  if (!cfg.VOICE_SIDECAR_URL) {
+    console.error("[voice] TTS_ENGINE is 'xtts' but VOICE_SIDECAR_URL is not set in config");
+    return;
+  }
+
   const player = spawn("paplay", [
     "--raw",
     `--rate=${SAMPLE_RATE}`,
@@ -74,14 +120,70 @@ export async function speak(text) {
   ]);
   player.on("error", (err) => console.error("[voice] paplay failed to start:", err.message));
 
-  synth.stdout.pipe(decoder.stdin);
-  decoder.stdout.pipe(player.stdin);
-
-  activeUpstream = [synth, decoder];
   activePlayer = player;
 
-  await new Promise((resolve) => player.on("exit", resolve));
+  const playDone = new Promise((resolve) => {
+    player.on("exit", () => {
+      if (activePlayer === player) activePlayer = null;
+      resolve();
+    });
+  });
 
-  if (activePlayer === player) activePlayer = null;
-  if (activeUpstream[0] === synth) activeUpstream = [];
+  const abort = new AbortController();
+  activeAbort = abort;
+
+  try {
+    const res = await fetch(cfg.VOICE_SIDECAR_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: clean }),
+      signal: abort.signal,
+    });
+
+    if (!res.ok || !res.body) {
+      console.error("[voice] xtts sidecar returned an error:", res.status, res.statusText);
+      player.stdin.end();
+    } else {
+      // Node's fetch gives a web ReadableStream; pipe raw PCM straight into paplay.
+      const reader = res.body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!player.stdin.writable) break;
+          player.stdin.write(Buffer.from(value));
+        }
+      } catch (err) {
+        if (err.name !== "AbortError") console.error("[voice] xtts stream read error:", err.message);
+      } finally {
+        player.stdin.end();
+      }
+    }
+  } catch (err) {
+    if (err.name !== "AbortError") console.error("[voice] xtts request failed:", err.message);
+    player.stdin.end();
+  } finally {
+    if (activeAbort === abort) activeAbort = null;
+  }
+
+  await playDone;
+}
+
+export async function speak(text) {
+  const clean = sanitizeInput(text);
+  if (!clean) return;
+
+  if (activePlayer) {
+    console.warn("[voice] speak() called while already playing -- stopping previous playback");
+    killActive();
+  }
+
+  if (TTS_ENGINE === "xtts") {
+    await speakXtts(clean);
+  } else {
+    if (TTS_ENGINE !== "edge-tts") {
+      console.warn(`[voice] unknown TTS_ENGINE "${TTS_ENGINE}", falling back to edge-tts`);
+    }
+    await speakEdgeTts(clean);
+  }
 }
