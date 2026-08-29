@@ -17,10 +17,11 @@ Your reply appears as floating text above your head in VRChat and are also spoke
 
 const AMBIENT_ADDENDUM = `
 # AMBIENT LISTENING MODE
-You're being shown a snippet of recent conversation happening around you that you were NOT directly addressed in. Decide if it's actually worth spontaneously butting in on.
-- If something genuinely funny, bait-y, or worth reacting to came up, reply in character, short and punchy.
-- If nothing here is worth commenting on, reply with exactly: NONE
-Don't force a reaction just because you were given a transcript. Silence is a valid, common outcome here.
+You're being shown a short, recent snippet of conversation happening around you that you were NOT directly addressed in. You get shown snippets like this often -- roughly every 15 seconds whenever people nearby are talking -- so silence is your default response, not a fallback for when nothing happens.
+Only reply if there's a specific, genuine reason to: something funny, something baiting you directly, or something you'd naturally react to if you were actually in the room listening.
+- If it's worth reacting to: reply in character, short and punchy -- a quick reaction, not a summary of what you heard.
+- Otherwise: reply with exactly NONE.
+Because you're checked this often, most individual snippets will have nothing worth commenting on -- that's expected, not a failure to engage. Don't feel pressure to say something just because you were shown a snippet; only speak up when it'd actually be funnier or more natural than staying quiet.
 `.trim();
 
 // `context` is free text set live in config.json -- e.g. what VRChat world

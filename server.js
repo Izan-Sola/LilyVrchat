@@ -8,7 +8,7 @@ const IDLE_MESSAGE = "";
 
 const IDLE_RESEND_INTERVAL_MS = 15000;
 const REPLY_HOLD_MS = 8500;
-const COOLDOWN_MS = 10000;
+const COOLDOWN_MS = 5000;
 
 let idleInterval = null;
 let replyTimer = null;
@@ -90,11 +90,11 @@ export async function requestReply(situation, text, { withImage = false, bypassC
   lastSentAt = Date.now();
   setStatus(withImage ? "Thinking (with image)..." : "Thinking...");
   try {
-    const reply = await queryBrainMessage(situation, text, { withImage });
-    if (reply !== "NONE") {
-      await handleReply(reply);
-    }
-    return { reply };
+  const reply = await queryBrainMessage(situation, text, { withImage });
+  if (reply !== "NONE") {
+    await handleReply(reply);
+  }
+  return { reply };
   } finally {
     pipelineBusy = false;
   }

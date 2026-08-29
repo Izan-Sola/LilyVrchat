@@ -1,6 +1,6 @@
 import { send } from "./osc.js";
 
-const STATUS_TITLE = "[Lily]";
+const STATUS_TITLE = "[Lily - ENG]";
 
 export function say(text, { immediate = true, sfx = false } = {}) {
   if (!text) return;

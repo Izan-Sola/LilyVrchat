@@ -30,3 +30,13 @@ export function send(address, args = []) {
   if (!port) throw new Error("OSC port not initialized -- call initOsc() first");
   port.send({ address, args });
 }
+
+export function setAxis(address, value) {
+  send(address, [{ type: "f", value }]);
+}
+
+export function stopMovement() {
+  ["/input/MoveForward", "/input/MoveBackward", "/input/MoveLeft", "/input/MoveRight", "/input/Vertical", "/input/Horizontal", "/input/LookHorizontal"].forEach((addr) =>
+    send(addr, [{ type: "f", value: 0 }])
+  );
+}

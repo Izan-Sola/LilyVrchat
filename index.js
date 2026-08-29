@@ -1,10 +1,12 @@
 import readline from "readline";
+import { initFollow, toggleFollowFeature } from "./follow.js";
 import { initOsc } from "./osc.js";
 import { triggerAvatarActionById } from "./avatarActions.js";
 import { startWebServer, requestReply } from "./server.js";
 import { startVoiceListener, skipCurrentRecording, toggleManualRecording, toggleButtIn, forceSendLastTranscript } from "./audioLoop.js";
 
 initOsc();
+initFollow();
 startWebServer(3030);
 startVoiceListener();
 console.log(`
@@ -39,6 +41,10 @@ if (process.stdin.isTTY) {
     }
     if (key?.name === "b" && !key.ctrl && !key.meta) {
       toggleButtIn();
+    }
+    if (key?.name === "f" && !key.ctrl && !key.meta) {
+      const enabled = toggleFollowFeature();
+      console.log(`[test] follow ${enabled ? "enabled" : "disabled"}`);
     }
     if (key?.name === "backspace") {
       forceSendLastTranscript();
