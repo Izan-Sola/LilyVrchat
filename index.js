@@ -4,7 +4,7 @@ import { initOsc } from "./vrchat/osc.js";
 import { triggerAvatarActionById } from "./bot/avatarActions.js";
 import { startWebServer, requestReply } from "./server.js";
 import { startVoiceListener, skipCurrentRecording, toggleManualRecording, toggleButtIn, forceSendLastTranscript } from "./audiostuff/audioLoop.js";
-import { initVrchatAutoJoin, stopVrchatAutoJoin, toggleAutoJoin } from "./vrchat/vrchatBridge.js";
+import { initVrchatAutoJoin, stopVrchatAutoJoin, toggleAutoJoin } from "./vrchatBridge.js";
 
 initOsc();
 initFollow();
