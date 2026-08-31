@@ -4,13 +4,12 @@ import { initOsc } from "./vrchat/osc.js";
 import { triggerAvatarActionById } from "./bot/avatarActions.js";
 import { startWebServer, requestReply } from "./server.js";
 import { startVoiceListener, skipCurrentRecording, toggleManualRecording, toggleButtIn, forceSendLastTranscript } from "./audiostuff/audioLoop.js";
-import { initVrchatAutoJoin, stopVrchatAutoJoin, toggleAutoJoin } from "./vrchatBridge.js";
 
 initOsc();
 initFollow();
 startWebServer(3030);
 startVoiceListener();
-initVrchatAutoJoin();
+
 console.log(`
 Commands:
   !<text>    - send text-only message to Lily     (e.g. !hi)
@@ -92,6 +91,5 @@ rl.on("line", async (line) => {
 
 process.on("SIGINT", () => {
   console.log("\n[index] shutting down");
-  stopVrchatAutoJoin();
   process.exit(0);
 });
