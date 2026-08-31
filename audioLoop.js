@@ -1,9 +1,16 @@
 import { spawn } from "child_process";
 import { unlink, readFile } from "fs/promises";
+import { tmpdir } from "os";
+import { join } from "path";
 import { RealTimeVAD } from "@ericedouard/vad-node-realtime";
 import cfg from "./config.js";
 import { requestReply } from "./server.js";
 import { setStatus } from "./chatbox.js";
+
+// KDE and GNOME both drive audio through PulseAudio/PipeWire the same
+// way (parec), so only WINDOWS branches differently here. Set PLATFORM
+// in config.json to "KDE", "GNOME", or "WINDOWS".
+const isWindows = String(cfg.PLATFORM || "GNOME").toUpperCase() === "WINDOWS";
 
 const realLog = (msg) => process.stdout.write(msg + "\n");
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -29,7 +36,7 @@ let carryByte = null; // holds a leftover odd byte between stdout chunks so 16-b
 let discardNextResult = false; // set when manual mode interrupts an in-progress ambient utterance
 
 // -- manual (untimed) push-to-talk recording ----------------------------
-const MANUAL_AUDIO_PATH = "/tmp/lily_manual_audio.wav";
+const MANUAL_AUDIO_PATH = join(tmpdir(), "lily_manual_audio.wav");
 let manualProc = null;
 let manualActive = false;
 
@@ -243,12 +250,29 @@ async function initVad() {
 // process fine -- we just drop ambient chunks while manual mode owns the
 // turn (see the `manualActive` check below) instead of tearing this down.
 function startAmbientStream() {
-  ambientProc = spawn("parec", [
-    "--channels=1",
-    "--rate=16000",
-    "--format=s16le",
-    "-d", cfg.AUDIO_MONITOR_SOURCE,
-  ]);
+  // Linux/GNOME: parec streams raw PCM straight off a PulseAudio monitor
+  // source (AUDIO_MONITOR_SOURCE, e.g. the sink monitor name from `pactl
+  // list sources`). Windows has no PulseAudio/parec, so ffmpeg (already a
+  // dependency) captures from a DirectShow audio device instead --
+  // AUDIO_MONITOR_SOURCE should then be a device name from
+  // `ffmpeg -list_devices true -f dshow -i dummy` (e.g. "Stereo Mix" or a
+  // virtual cable's output rendered as a recording device).
+  ambientProc = isWindows
+    ? spawn("ffmpeg", [
+        "-loglevel", "error",
+        "-f", "dshow",
+        "-i", `audio=${cfg.AUDIO_MONITOR_SOURCE}`,
+        "-ac", "1",
+        "-ar", "16000",
+        "-f", "s16le",
+        "pipe:1",
+      ])
+    : spawn("parec", [
+        "--channels=1",
+        "--rate=16000",
+        "--format=s16le",
+        "-d", cfg.AUDIO_MONITOR_SOURCE,
+      ]);
 
   ambientProc.stdout.on("data", (chunk) => {
     if (carryByte !== null) {
@@ -268,13 +292,13 @@ function startAmbientStream() {
   });
 
   ambientProc.on("error", (err) => {
-    realLog(`[voice] ambient parec failed to start: ${err.message}`);
+    realLog(`[voice] ambient ${isWindows ? "ffmpeg" : "parec"} failed to start: ${err.message}`);
   });
 
   ambientProc.on("exit", (code) => {
     ambientProc = null;
     if (running) {
-      realLog(`[voice] ambient parec exited (code ${code}), restarting...`);
+      realLog(`[voice] ambient ${isWindows ? "ffmpeg" : "parec"} exited (code ${code}), restarting...`);
       setTimeout(startAmbientStream, 500);
     }
   });
@@ -340,13 +364,23 @@ function startManualRecording() {
   realLog("[voice] manual recording started (press Enter to stop)...");
   setStatus("Listening...");
 
-  manualProc = spawn("parec", [
-    "--file-format=wav",
-    "--channels=1",
-    "--rate=16000",
-    "-d", cfg.AUDIO_MONITOR_SOURCE,
-    MANUAL_AUDIO_PATH,
-  ]);
+  manualProc = isWindows
+    ? spawn("ffmpeg", [
+        "-y",
+        "-loglevel", "error",
+        "-f", "dshow",
+        "-i", `audio=${cfg.AUDIO_MONITOR_SOURCE}`,
+        "-ac", "1",
+        "-ar", "16000",
+        MANUAL_AUDIO_PATH,
+      ])
+    : spawn("parec", [
+        "--file-format=wav",
+        "--channels=1",
+        "--rate=16000",
+        "-d", cfg.AUDIO_MONITOR_SOURCE,
+        MANUAL_AUDIO_PATH,
+      ]);
   manualProc.on("error", (err) => {
     realLog(`[voice] manual recording failed to start: ${err.message}`);
     manualActive = false;
@@ -367,7 +401,13 @@ async function stopManualRecording() {
 
   await new Promise((resolve) => {
     proc.once("exit", resolve);
-    proc.kill("SIGTERM");
+    if (isWindows) {
+      // ffmpeg needs a graceful "q" on stdin to finalize the wav file's
+      // header/size fields -- SIGTERM would leave it truncated/unreadable.
+      proc.stdin.write("q");
+    } else {
+      proc.kill("SIGTERM");
+    }
   });
 
   const rawText = await transcribe(MANUAL_AUDIO_PATH);
