@@ -2,7 +2,7 @@ If you want to use this yourself, check this: https://github.com/Izan-Sola/Lily/
 
 ### What it can do:
 
-    - Follow you around
-    - Listen to the game audio
-    - Talk in game
-    - Automatically accept your world invites
+- Follow you around
+- Listen to the game audio
+- Talk in game
+- Automatically accept your world invites
