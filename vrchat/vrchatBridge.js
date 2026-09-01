@@ -285,8 +285,8 @@ async function killExistingVrchatLinux() {
 }
 
 async function handleInviteNotification(content) {
-  if (cfg.VRCHAT_TRUSTED_INVITER_ID && content.senderUserId !== cfg.VRCHAT_TRUSTED_INVITER_ID) {
-    realLog(`[vrchat] ignoring invite from ${content.senderUserId} (not the trusted inviter)`);
+  if (cfg.VRCHAT_TRUSTED_INVITERS_IDS && !cfg.VRCHAT_TRUSTED_INVITERS_IDS.includes(content.senderUserId)) {
+    realLog(`[vrchat] ignoring invite from ${content.senderUserId} (not a trusted inviter)`);
     return;
   }
   if (!autoJoinEnabled) {
