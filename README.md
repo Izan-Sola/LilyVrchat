@@ -5,5 +5,5 @@ If you want to use this yourself, check this: https://github.com/Izan-Sola/Lily/
 - Follow you around
 - Listen to the game audio
 - Talk in game
-- Automatically accept your world invites
+- Automatically accept world invites from the trusted users list
 - Perform default VRChat expressions (cheering, dying, dancing, etc...)
