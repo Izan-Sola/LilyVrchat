@@ -1,7 +1,7 @@
 import cfg from "../util/config.js";
 import { getSystemPrompt, getButtInSystemPrompt } from "./prompts.js";
 import { captureBase64 } from "./perception.js";
-import { TOOL_DEFINITIONS, runTool } from "./tools.js";
+import { getToolDefinitions, runTool } from "./tools.js";
 
 const MAX_RETRIES = 4; // retries for empty/malformed replies
 const MAX_TOOL_ITERATIONS = 3; // cap on chained tool calls before we give up and just reply
@@ -61,7 +61,7 @@ async function callBrainOnce(messages, overrides = {}) {
   const res = await fetch(cfg.BRAIN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ messages, tools: TOOL_DEFINITIONS, ...overrides }),
+    body: JSON.stringify({ messages, tools: getToolDefinitions(), ...overrides }),
   });
   const data = await res.json();
   return data.choices?.[0]?.message ?? null;
@@ -122,8 +122,26 @@ async function callBrain(userContent, systemPrompt = getSystemPrompt()) {
 
     if (toolCalls.length && toolIterations < MAX_TOOL_ITERATIONS) {
       toolIterations++;
-      const results = await Promise.all(toolCalls.map((tc) => runTool(tc.name, tc.arguments)));
-      scratch = [...scratch, ...buildToolFollowupMessages(msg, toolCalls, results)];
+      const rawResults = await Promise.all(toolCalls.map((tc) => runTool(tc.name, tc.arguments)));
+      // Tool-result slots are text-only in both calling conventions above,
+      // so pull out the text part for those, and separately attach any
+      // image a tool captured (currently just capture_screenshot) as its
+      // own follow-up user message right after.
+      const textResults = rawResults.map((r) => (typeof r === "string" ? r : r.text));
+      scratch = [...scratch, ...buildToolFollowupMessages(msg, toolCalls, textResults)];
+
+      for (const r of rawResults) {
+        if (r && typeof r === "object" && r.image) {
+          scratch.push({
+            role: "user",
+            content: [
+              { type: "image_url", image_url: { url: `data:image/png;base64,${r.image}` } },
+              { type: "text", text: "(This is the screenshot you just took.)" },
+            ],
+          });
+        }
+      }
+
       continue;
     }
 
@@ -168,9 +186,16 @@ export async function queryBrainButtIn(transcriptText) {
 // address apart from overheard chatter. `situation` is "user" (default --
 // someone talking to her directly, whatever the input method) or
 // "ambient" (butt-in commentary on a conversation she wasn't addressed
-// in). Screenshots are opt-in via `withImage` -- attaching one on every
-// turn made live voice back-and-forth too slow, so callers only ask for
-// one when they actually need visual context.
+// in).
+//
+// Screenshots are opt-in per call via `withImage` -- attaching one on
+// every turn made live voice back-and-forth too slow, so callers only ask
+// for one when they actually need visual context. Setting
+// ALWAYS_APPEND_SCREENSHOT to true in config.json overrides this globally
+// and forces every call through the vision path instead, regardless of
+// what the caller asked for; when that's on, tools.js also stops offering
+// the capture_screenshot tool, since there's no point letting her ask for
+// something she's already getting every message.
 const SITUATION_PREFIXES = {
   user: "User is saying:",
   ambient: "People around are saying:",
@@ -180,7 +205,9 @@ export async function queryBrainMessage(situation, text, { withImage = false } =
   const prefix = SITUATION_PREFIXES[situation] ?? SITUATION_PREFIXES.user;
   const systemPrompt = situation === "ambient" ? getButtInSystemPrompt() : getSystemPrompt();
 
-  if (!withImage) {
+  const attachImage = withImage || cfg.ALWAYS_APPEND_SCREENSHOT === true;
+
+  if (!attachImage) {
     return callBrain(`${prefix} ${text}`, systemPrompt);
   }
 
