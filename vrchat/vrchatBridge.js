@@ -10,8 +10,8 @@ const realLog = (msg) => process.stdout.write(msg + "\n");
 
 const API_BASE = "https://api.vrchat.cloud/api/1";
 // VRChat's API policy wants a descriptive User-Agent with contact info --
-// generic ones get rate-limited harder. Override via config if you want.
-const USER_AGENT = cfg.VRCHAT_USER_AGENT || "LilyVRBridge/1.0 contact@example.com";
+// generic ones get rate-limited harder.
+const USER_AGENT = "VRChatCompanionBot/1.0 solamontesinosizan@gmail.com";
 const SESSION_PATH = cfg.VRCHAT_SESSION_PATH || "./.vrchat_session.json";
 
 // Cookie jar. VRChat auth is old-school cookie-based (an "auth" cookie,
