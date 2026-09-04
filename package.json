@@ -1,0 +1,20 @@
+{
+  "name": "lily-vrchat-bridge",
+  "version": "0.1.0",
+  "description": "Standalone OSC bridge letting Lily follow and talk in VRChat",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node cli.js"
+  },
+  "dependencies": {
+    "@ericedouard/vad-node-realtime": "^0.2.0",
+    "express": "^5.2.1",
+    "node": "^26.7.0",
+    "nodejs-whisper": "^0.3.1",
+    "osc": "^2.4.5",
+    "otplib": "^13.5.0",
+    "ws": "^8.21.3"
+  }
+}
